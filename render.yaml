@@ -1,0 +1,20 @@
+# Render blueprint for the R&A Live Office canonical backend (LO-2026-10-06-R1).
+# Deploys backend/office_api.py (stdlib-only, GET-only) as a Starter web service.
+# Data: the 30-agent trading data is rsync'd from the primary VM to $HOME/workspace
+# every ~10 minutes (see data-sync notes in RELEASE_RECORD.md). The backend reads
+# DATA_ROOT = os.path.expanduser("~/workspace"), so HOME is pointed at the data
+# mount below. No code changes to the frozen artifact.
+
+services:
+  - type: web
+    name: ra-live-office-backend
+    runtime: python
+    plan: starter            # $7/mo — stays awake; free tier sleeps and breaks SSE
+    buildCommand: ""         # stdlib only, nothing to install
+    startCommand: python backend/office_api.py $PORT
+    healthCheckPath: /api/office/health
+    envVars:
+      - key: HOME
+        value: /opt/render/project/data
+      - key: PYTHONUNBUFFERED
+        value: "1"
