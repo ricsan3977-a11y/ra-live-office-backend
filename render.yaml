@@ -11,7 +11,7 @@ services:
     runtime: python
     plan: starter            # $7/mo — stays awake; free tier sleeps and breaks SSE
     buildCommand: ""         # stdlib only, nothing to install
-    startCommand: python backend/office_api.py $PORT
+    startCommand: python backend/launcher.py
     healthCheckPath: /api/office/health
     envVars:
       - key: HOME
