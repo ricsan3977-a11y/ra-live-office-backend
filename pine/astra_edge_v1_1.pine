@@ -25,6 +25,15 @@
 //  3. Working locals renamed with w_ prefix so they cannot shadow any
 //     contract global; contract globals keep g_ prefix exclusively.
 //
+//  REV C CORRECTIONS (TradingView compile, 2026-10-12 — 0 errors, 25 warnings):
+//  1. The 24 contract-global assignments in the populate block used "="
+//     inside the "if barstate.isconfirmed" block, which Pine treats as
+//     declaring block-local shadows — the emitted JSON would have carried
+//     the globals' initial empty values. All 24 now use ":=" so they
+//     update the globals f_canon_json() actually reads.
+//  2. ta.atr(14) moved to global scope: ta.* calls must evaluate on every
+//     bar for consistent results (was the 25th warning).
+//
 //  WHAT THIS DOES
 //  Emits ONE dynamic alert() JSON per confirmed signal bar, carrying the actual
 //  footprint/delta readings. The receiving edge validates, canonicalizes, and
@@ -194,6 +203,10 @@ sessHi = request.security(syminfo.tickerid, "15", ta.highest(high, 26), lookahea
 sessLo = request.security(syminfo.tickerid, "15", ta.lowest(low, 26),  lookahead=barmerge.lookahead_off)
 ema15  = request.security(syminfo.tickerid, "15", ta.ema(close, 21),   lookahead=barmerge.lookahead_off)
 
+// ATR at global scope: ta.* calls must evaluate on every bar for consistent
+// results (TradingView warns when they are conditional).
+atrV = ta.atr(14)
+
 // ════════════════════════ FOOTPRINT ADAPTER ═════════════════════════════════
 // Correct v6 API: request.footprint(ticks_per_row, va_percent,
 //                                  imbalance_percent = n)
@@ -252,8 +265,6 @@ sigRelS    = false
 // functions from modifying globals.
 
 if barstate.isconfirmed
-    atrV = ta.atr(14)
-
     // ---- per-bar working vars (w_ prefix; never g_) ----
     bool wNewSweepL  = false
     bool wNewSweepS  = false
@@ -438,31 +449,31 @@ if barstate.isconfirmed
         bool wIsDU   = wEvType == "DATA_UNAVAILABLE"
         bool wIsPing = wEvType == "TEST_PING"
         int  wFreshV = stDir == "NONE" ? 0 : bar_index - stBar
-        g_event_type    = wEvType
-        g_event_id      = syminfo.ticker + "_" + str.tostring(int(time)) + "_" + wEvType
-        g_symbol        = syminfo.ticker
-        g_contract      = inContract == "" ? syminfo.ticker : inContract
-        g_direction     = (wIsDU or wIsPing) ? "NONE" : stDir
-        g_market_ts     = int(time)
-        g_observed      = int(timenow)
-        g_setup_id      = wIsPing ? "TEST-PING" : stSetupId
-        g_liq_type      = wIsPing ? "NONE" : stLiqType
-        g_liq_price     = wIsPing ? na : stLevel
-        g_sweep_conf    = not wIsPing and stDir != "NONE"
-        g_absorption    = wIsDU ? "DATA_UNAVAILABLE" : wIsPing ? "NONE" : stAbsorb
-        g_flow          = wIsDU ? "DATA_UNAVAILABLE" : wIsPing ? "NEUTRAL" : stFlow
-        g_long          = (wIsDU or wIsPing) ? 0 : wLongScore
-        g_short         = (wIsDU or wIsPing) ? 0 : wShortScore
-        g_gap           = (wIsDU or wIsPing) ? 0 : wGap
-        g_reclaim       = wIsDU ? "DATA_UNAVAILABLE" : wIsPing ? "NONE" : stReclaim
-        g_room_r        = (wIsDU or wIsPing) ? na : wRoom
-        g_target_ref    = wTgtRef
+        g_event_type := wEvType
+        g_event_id := syminfo.ticker + "_" + str.tostring(int(time)) + "_" + wEvType
+        g_symbol := syminfo.ticker
+        g_contract := inContract == "" ? syminfo.ticker : inContract
+        g_direction := (wIsDU or wIsPing) ? "NONE" : stDir
+        g_market_ts := int(time)
+        g_observed := int(timenow)
+        g_setup_id := wIsPing ? "TEST-PING" : stSetupId
+        g_liq_type := wIsPing ? "NONE" : stLiqType
+        g_liq_price := wIsPing ? na : stLevel
+        g_sweep_conf := not wIsPing and stDir != "NONE"
+        g_absorption := wIsDU ? "DATA_UNAVAILABLE" : wIsPing ? "NONE" : stAbsorb
+        g_flow := wIsDU ? "DATA_UNAVAILABLE" : wIsPing ? "NEUTRAL" : stFlow
+        g_long := (wIsDU or wIsPing) ? 0 : wLongScore
+        g_short := (wIsDU or wIsPing) ? 0 : wShortScore
+        g_gap := (wIsDU or wIsPing) ? 0 : wGap
+        g_reclaim := wIsDU ? "DATA_UNAVAILABLE" : wIsPing ? "NONE" : stReclaim
+        g_room_r := (wIsDU or wIsPing) ? na : wRoom
+        g_target_ref := wTgtRef
         // armed=true is emitted ONLY with ARMED/RELEASE (relay coherence rule).
-        g_armed         = wEvType == "ARMED" or wEvType == "RELEASE"
-        g_release_state = stReleaseState
-        g_fp_ok         = wFpOk
-        g_fresh_bars    = wFreshV
-        g_stack_rows    = stStackRows
+        g_armed := wEvType == "ARMED" or wEvType == "RELEASE"
+        g_release_state := stReleaseState
+        g_fp_ok := wFpOk
+        g_fresh_bars := wFreshV
+        g_stack_rows := stStackRows
         f_emit_event()
         if wIsPing
             pingDone := true
