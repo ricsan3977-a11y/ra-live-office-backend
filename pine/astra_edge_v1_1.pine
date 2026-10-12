@@ -34,6 +34,16 @@
 //  2. ta.atr(14) moved to global scope: ta.* calls must evaluate on every
 //     bar for consistent results (was the 25th warning).
 //
+//  REV D (2026-10-12 — realtime ping-only transport test):
+//  1. Replaced the plain TEST_PING one-shot with ping-only mode: the old
+//     flag could be consumed by historical bars during recalculation
+//     (barstate.isconfirmed is true on history), so the realtime bar would
+//     never fire. The ping is now gated on barstate.isrealtime — false on
+//     all historical bars — and fires on the next realtime bar close only.
+//  2. While ping-only is ON, no signal event (SWEEP/ARMED/RELEASE/...) can
+//     emit: the webhook carries exactly one TEST_PING and nothing else.
+//     Turn the input OFF after the transport test to enable signal events.
+//
 //  WHAT THIS DOES
 //  Emits ONE dynamic alert() JSON per confirmed signal bar, carrying the actual
 //  footprint/delta readings. The receiving edge validates, canonicalizes, and
@@ -54,7 +64,9 @@
 //  If the compiler reports errors, paste them back verbatim for correction.
 //  Then: create alert → "alert() function calls only" → webhook URL
 //  https://ra-live-office-backend.onrender.com/ingest/tv?token=<token>
-//  (token value is NOT in this script) → fire TEST_PING first.
+//  (token value is NOT in this script) → tick "Ping-only transport test",
+//  create the alert, and the next realtime bar close fires ONE TEST_PING
+//  and nothing else. Untick ping-only after the transport test.
 //
 //  Connectivity test vs profitability proof: this emitter proves ONE genuine
 //  alert traverses footprint -> JSON -> webhook -> lifecycle -> audit.
@@ -89,9 +101,9 @@ inImbPct = input.int(300, "Footprint imbalance %",
      tooltip="Row imbalance detection threshold. 300 = 3x opposing volume.")
 inContract = input.string("", "Contract override (blank = chart symbol)",
      group="Symbol")
-inTestPing = input.bool(false, "Send TEST_PING on next bar close (one-shot)",
+inPingOnly = input.bool(false, "Ping-only transport test (realtime one-shot)",
      group="Diagnostics",
-     tooltip="Fires one TEST_PING event to verify the webhook path, then latches off.")
+     tooltip="When ON: emits ONE TEST_PING on the next realtime bar close and suppresses all signal events. Historical bars cannot consume it (realtime-gated). Turn OFF after the transport test to enable signal events.")
 
 scoreFloor = math.max(inScoreMin, 72)
 gapFloor   = math.max(inGapMin, 15)
@@ -426,9 +438,14 @@ if barstate.isconfirmed
         wTerminal := stReclaim == "FAILED" or (wBarsSince > inFresh and not stArmed)
 
     // ---- event selection: one alert per bar close, highest priority wins ----
-    // TEST_PING works even with no active setup.
-    if inTestPing and not pingDone
-        wEvType := "TEST_PING"
+    // Ping-only transport test: realtime one-shot. barstate.isrealtime is false
+    // on historical bars, so recalculation can never consume the flag — the
+    // ping fires on the next realtime bar close only. While ping-only is ON,
+    // no signal event can emit: ordinary alerts stay silent until the mode
+    // is turned off after the transport test.
+    if inPingOnly
+        if barstate.isrealtime and not pingDone
+            wEvType := "TEST_PING"
     else if not wFpOk and (wNewSweepL or wNewSweepS)
         wEvType := "DATA_UNAVAILABLE"
     else if wDoRelease
