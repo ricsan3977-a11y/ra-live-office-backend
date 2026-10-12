@@ -60,6 +60,10 @@ def route_path(head: bytes) -> str:
         return "backend"
     if path == "/webhook/astra" or path.startswith("/webhook/astra/"):
         return "relay"
+    # ASTRA v1.1 TV ingest edge (configurable path, default /ingest/tv).
+    tv_path = os.environ.get("ASTRA_TV_INGEST_PATH", "/ingest/tv")
+    if path == tv_path:
+        return "relay"
     return "backend"
 
 
