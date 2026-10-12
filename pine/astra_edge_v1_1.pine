@@ -1,21 +1,35 @@
 //@version=6
 // =============================================================================
 //  R&A ASTRA Edge v1.1 — TradingView dynamic alert() emitter (Pine Script v6)
+//  CORRECTED REV B — 2026-10-12
 // =============================================================================
 //  Contract : astra-edge-event-v1.1 (30 canonical keys, ASCII-sorted)
 //  Strategy : STRATEGY2_ASTRA_EDGE_V1 · version 1.0.2
 //  Mode     : SHADOW ONLY · order_permission = false
 //
+//  REV B CORRECTIONS (Ric's code review, 2026-10-12):
+//  1. Footprint API was wrong. Correct v6 API:
+//       footprint fp = request.footprint(ticks_per_row, va_percent,
+//                                        imbalance_percent = n)
+//     returns a `footprint` object for the CURRENT chart bar (no ticker /
+//     timeframe args), or na when unavailable (Premium/Ultimate required).
+//     Readings via fp.buy_volume() / fp.sell_volume() / fp.delta(), and
+//     stacked imbalance rows by iterating fp.rows() (array<volume_row>)
+//     counting CONSECUTIVE rows with has_buy_imbalance()/has_sell_imbalance().
+//     The old tuple-destructure form never existed and could not compile.
+//     (Note: v1.0's pine had the same uncorrected call and was never
+//     compiler-verified.)
+//  2. f_reset_setup() assigned to globals from inside a function — illegal in
+//     Pine (functions cannot modify globals). Resets are now inlined at
+//     global scope, the only place := on globals is legal.
+//  3. Working locals renamed with w_ prefix so they cannot shadow any
+//     contract global; contract globals keep g_ prefix exclusively.
+//
 //  WHAT THIS DOES
 //  Emits ONE dynamic alert() JSON per confirmed signal bar, carrying the actual
-//  footprint/delta/CVD readings from request.footprint(). The receiving edge
-//  validates, canonicalizes, and HMAC-signs off-chart — Pine never sees a
-//  secret, never sends payload_hash, and never assigns strategy_run_id.
-//
-//  WHAT THIS DOES NOT DO
-//  No orders. No brokerage. No secrets in the script. No invented evidence:
-//  missing footprint takes the DATA_UNAVAILABLE path (scores stay 0,
-//  absorption reports DATA_UNAVAILABLE) — delta is never assumed 0.
+//  footprint/delta readings. The receiving edge validates, canonicalizes, and
+//  HMAC-signs off-chart — Pine never sees a secret, never sends payload_hash,
+//  and never assigns strategy_run_id (null on the wire, ruling 5).
 //
 //  NO-REPAINT CONTRACT
 //  Every state transition is evaluated ONLY on confirmed bars
@@ -26,18 +40,17 @@
 //  score >= 72 · directional gap >= 15 · room >= 1.8R · freshness <= 8 bars ·
 //  2-row stacked imbalance. 15M context is a score input, NEVER a veto.
 //
-//  SETUP (Ric's steps, in TradingView)
-//  1. Paste this script into the Pine Editor on the NQ1! 1-minute chart and
-//     "Add to chart".
-//  2. Create an alert: Condition = this indicator, "alert() function calls
-//     only", Webhook URL = the relay /ingest/tv URL, Message = {{strategy.order.alert_message}}
-//     (leave the message box as the placeholder — the script supplies the JSON).
-//  3. Fire the built-in TEST_PING first (input D), then watch the relay log.
+//  COMPILE CHECK (required — only TradingView can do this)
+//  Paste into the Pine Editor on the NQZ2026 1-minute chart, "Add to chart".
+//  If the compiler reports errors, paste them back verbatim for correction.
+//  Then: create alert → "alert() function calls only" → webhook URL
+//  https://ra-live-office-backend.onrender.com/ingest/tv?token=<token>
+//  (token value is NOT in this script) → fire TEST_PING first.
 //
 //  Connectivity test vs profitability proof: this emitter proves ONE genuine
-//  alert traverses footprint -> delta -> JSON -> webhook -> lifecycle -> audit.
+//  alert traverses footprint -> JSON -> webhook -> lifecycle -> audit.
 //  It says nothing about strategy profitability — that is the counted shadow
-//  sample (separate, later, sample_count starts at 0).
+//  sample's job, separate and later.
 // =============================================================================
 
 indicator("R&A ASTRA Edge v1.1 emitter", overlay=true)
@@ -57,6 +70,14 @@ inRoomMin  = input.float(1.8, "Min room to target (R)",
 inFresh    = input.int(8, "Freshness window (bars)",
      minval=1, maxval=8, group="Gates",
      tooltip="Sweep evidence expires after this many 1M bars. Contract max 8.")
+inTicksPerRow = input.int(100, "Footprint ticks per row",
+     minval=1, group="Footprint",
+     tooltip="Price granularity of each footprint row, in ticks.")
+inVAPct = input.int(70, "Footprint Value Area %",
+     minval=1, maxval=100, group="Footprint")
+inImbPct = input.int(300, "Footprint imbalance %",
+     minval=100, group="Footprint",
+     tooltip="Row imbalance detection threshold. 300 = 3x opposing volume.")
 inContract = input.string("", "Contract override (blank = chart symbol)",
      group="Symbol")
 inTestPing = input.bool(false, "Send TEST_PING on next bar close (one-shot)",
@@ -81,6 +102,7 @@ STRAT_VER = "1.0.2"
 SCHEMA_V  = "astra-edge-event-v1.1"
 
 // ═══════════════════ CONTRACT FIELD GLOBALS (per emitted event) ════════════
+// g_ prefix is reserved for these. No other variable may use it.
 
 string g_event_type = ""
 string g_event_id   = ""
@@ -142,7 +164,7 @@ f_canon_json() =>
      "\"liquidity_price\":"      + f_jnum2(g_liq_price)   + "," +
      "\"liquidity_type\":"       + f_jstr(g_liq_type)     + "," +
      "\"long_score\":"           + f_jint(g_long)         + "," +
-     "\"market_ts\":"            + f_jint(g_market_ts)    + "," +
+     "\"market_ts\":"            + f_jint(g_market_ts)   + "," +
      "\"observed_at\":"          + f_jint(g_observed)     + "," +
      "\"reclaim_state\":"        + f_jstr(g_reclaim)      + "," +
      "\"release_state\":"        + f_jstr(g_release_state)+ "," +
@@ -163,7 +185,7 @@ f_canon_json() =>
 f_emit_event() =>
     alert(f_canon_json(), alert.freq_once_per_bar_close)
 
-// ════════════════════ MULTI-TIMEFRAME CONTEXT (15M / 2M) ════════════════════
+// ════════════════════ MULTI-TIMEFRAME CONTEXT (15M) ═════════════════════════
 // lookahead_off everywhere: no future leak, no repaint.
 
 pdh    = request.security(syminfo.tickerid, "D",  high[1], lookahead=barmerge.lookahead_off)
@@ -173,13 +195,30 @@ sessLo = request.security(syminfo.tickerid, "15", ta.lowest(low, 26),  lookahead
 ema15  = request.security(syminfo.tickerid, "15", ta.ema(close, 21),   lookahead=barmerge.lookahead_off)
 
 // ════════════════════════ FOOTPRINT ADAPTER ═════════════════════════════════
-// request.footprint(ticker, timeframe) -> [buyVol, sellVol, delta,
-// bullStackRows, bearStackRows]. Requires a TradingView build/plan exposing
-// footprint data; otherwise every output is na and the DATA_UNAVAILABLE path
-// engages. Delta is NEVER synthesized from OHLC — missing footprint is
-// reported, never faked.
-[fpBuy, fpSell, fpDelta, fpBullRows, fpBearRows] = request.footprint(syminfo.tickerid, "1")
-fpOk = not na(fpDelta)
+// Correct v6 API: request.footprint(ticks_per_row, va_percent,
+//                                  imbalance_percent = n)
+// Returns a `footprint` object for the CURRENT chart bar, or na when
+// unavailable (Premium/Ultimate required). Single call per script — Pine
+// errors on multiple footprint requests in one context.
+// Delta is NEVER synthesized from OHLC — missing footprint is reported via
+// the DATA_UNAVAILABLE path, never faked.
+footprint wFp = request.footprint(inTicksPerRow, inVAPct, imbalance_percent = inImbPct)
+bool wFpOk = not na(wFp)
+
+// Max run of CONSECUTIVE rows carrying the wanted imbalance side.
+// rows() returns volume_row IDs ordered lowest row first.
+f_max_stack(array<volume_row> rows, bool wantBuy) =>
+    int best = 0
+    int run = 0
+    for row in rows
+        bool imb = wantBuy ? row.has_buy_imbalance() : row.has_sell_imbalance()
+        if imb
+            run += 1
+            if run > best
+                best := run
+        else
+            run := 0
+    best
 
 // ════════════════════ SIGNAL STATE (confirmed bars only) ═══════════════════
 
@@ -208,56 +247,51 @@ sigArmedB  = false
 sigRelL    = false
 sigRelS    = false
 
-f_reset_setup() =>
-    stDir          := "NONE"
-    stLevel        := na
-    stLiqType      := "NONE"
-    stBar          := na
-    stTime         := na
-    stAbsorb       := "NONE"
-    stReclaim      := "NONE"
-    stFlow         := "NEUTRAL"
-    stArmed        := false
-    stArmedBar     := na
-    stReleased     := false
-    stReleaseState := "PENDING"
-    stSetupId      := ""
-    cumDelta       := 0.0
-    stStackRows    := 0
-
 // ═══════════════════════ MAIN: CONFIRMED BARS ONLY ══════════════════════════
+// NOTE: resets are inlined here (not in a function) because Pine forbids
+// functions from modifying globals.
 
 if barstate.isconfirmed
     atrV = ta.atr(14)
 
-    // ---- per-bar working vars ----
-    bool newSweepL  = false
-    bool newSweepS  = false
-    bool newAbsorb  = false
-    bool newReclaim = false
-    bool newFlow    = false
-    bool newlyArmed = false
-    bool doRelease  = false
-    bool terminal   = false
-    int  longScore  = 0
-    int  shortScore = 0
-    int  gapV       = 0
-    float roomV     = na
-    string tgtRef   = "NONE"
-    string evType   = ""
-    string relDir   = "NONE"      // release direction, captured before reset
+    // ---- per-bar working vars (w_ prefix; never g_) ----
+    bool wNewSweepL  = false
+    bool wNewSweepS  = false
+    bool wNewAbsorb  = false
+    bool wNewReclaim = false
+    bool wNewFlow    = false
+    bool wNewlyArmed = false
+    bool wDoRelease  = false
+    bool wTerminal   = false
+    int  wLongScore  = 0
+    int  wShortScore = 0
+    int  wGap        = 0
+    float wRoom      = na
+    string wTgtRef   = "NONE"
+    string wEvType   = ""
+    string wRelDir   = "NONE"      // release direction, captured before reset
 
-    string prevAbsorb  = stAbsorb
-    string prevReclaim = stReclaim
-    string prevFlow    = stFlow
+    string wPrevAbsorb  = stAbsorb
+    string wPrevReclaim = stReclaim
+    string wPrevFlow    = stFlow
+
+    // ---- footprint readings for the just-closed bar ----
+    float wDelta = na
+    int   wRowsL = 0
+    int   wRowsS = 0
+    if wFpOk
+        wDelta := wFp.delta()
+        array<volume_row> wArr = wFp.rows()
+        wRowsL := f_max_stack(wArr, true)
+        wRowsS := f_max_stack(wArr, false)
 
     // ---- 1. liquidity sweep detection (wick through PDH/PDL) ----
-    newSweepL := stDir == "NONE" and not na(pdl) and low < pdl
-    newSweepS := stDir == "NONE" and not na(pdh) and high > pdh
-    if newSweepL or newSweepS
-        stDir          := newSweepL ? "LONG" : "SHORT"
-        stLevel        := newSweepL ? pdl : pdh
-        stLiqType      := newSweepL ? "PDL" : "PDH"
+    wNewSweepL := stDir == "NONE" and not na(pdl) and low < pdl
+    wNewSweepS := stDir == "NONE" and not na(pdh) and high > pdh
+    if wNewSweepL or wNewSweepS
+        stDir          := wNewSweepL ? "LONG" : "SHORT"
+        stLevel        := wNewSweepL ? pdl : pdh
+        stLiqType      := wNewSweepL ? "PDL" : "PDH"
         stBar          := bar_index
         stTime         := int(time)
         stAbsorb       := "NONE"
@@ -273,179 +307,210 @@ if barstate.isconfirmed
 
     // ---- 2..6 active setup pipeline ----
     if stDir != "NONE"
-        bool isLong = stDir == "LONG"
-        int barsSince = bar_index - stBar
+        bool wIsLong = stDir == "LONG"
+        int wBarsSince = bar_index - stBar
 
         // footprint delta accumulation (confirmed bars only)
-        if fpOk
-            cumDelta := cumDelta + fpDelta
-            int rowsNow = isLong ? int(fpBullRows) : int(fpBearRows)
-            if rowsNow > stStackRows
-                stStackRows := rowsNow
+        if wFpOk
+            cumDelta := cumDelta + wDelta
+            int wRowsNow = wIsLong ? wRowsL : wRowsS
+            if wRowsNow > stStackRows
+                stStackRows := wRowsNow
 
         // 2. absorption: delta leans with the setup while the level holds
-        if fpOk and stAbsorb == "NONE"
-            bool heldL = isLong  and low  >= stLevel - 0.10 * atrV
-            bool heldS = not isLong and high <= stLevel + 0.10 * atrV
-            if isLong and cumDelta > 0 and heldL
+        if wFpOk and stAbsorb == "NONE"
+            bool wHeldL = wIsLong  and low  >= stLevel - 0.10 * atrV
+            bool wHeldS = not wIsLong and high <= stLevel + 0.10 * atrV
+            if wIsLong and cumDelta > 0 and wHeldL
                 stAbsorb := "SELLERS ABSORBED"
-            if not isLong and cumDelta < 0 and heldS
+            if not wIsLong and cumDelta < 0 and wHeldS
                 stAbsorb := "BUYERS ABSORBED"
 
         // 3. reclaim: close back through the swept level (close-confirmed)
-        if isLong and close > stLevel
+        if wIsLong and close > stLevel
             stReclaim := "CONFIRMED"
-        if not isLong and close < stLevel
+        if not wIsLong and close < stLevel
             stReclaim := "CONFIRMED"
         // invalidation: level lost badly -> FAILED (terminal, silent reset)
-        if (isLong and close < stLevel - 0.5 * atrV) or (not isLong and close > stLevel + 0.5 * atrV)
+        if (wIsLong and close < stLevel - 0.5 * atrV) or (not wIsLong and close > stLevel + 0.5 * atrV)
             stReclaim := "FAILED"
 
         // 4. flow shift: displacement = range expansion + strong directional close
-        float rng = high - low
-        if isLong and rng > 1.5 * atrV and close > open and close >= high - 0.25 * rng
+        float wRng = high - low
+        if wIsLong and wRng > 1.5 * atrV and close > open and close >= high - 0.25 * wRng
             stFlow := "BULLISH_SHIFT"
-        if not isLong and rng > 1.5 * atrV and close < open and close <= low + 0.25 * rng
+        if not wIsLong and wRng > 1.5 * atrV and close < open and close <= low + 0.25 * wRng
             stFlow := "BEARISH_SHIFT"
 
         // 5. evidence scores 0-100 (symmetric, sum of weights = 100)
-        if isLong
-            longScore := W_SWEEP
-            longScore := longScore + (stAbsorb == "SELLERS ABSORBED" ? W_ABSORB : 0)
-            longScore := longScore + (stStackRows >= STACK_ROWS_MIN ? W_STACK : 0)
-            longScore := longScore + (stReclaim == "CONFIRMED" ? W_RECLAIM : 0)
-            longScore := longScore + (stFlow == "BULLISH_SHIFT" ? W_FLOW : 0)
+        if wIsLong
+            wLongScore := W_SWEEP
+            wLongScore := wLongScore + (stAbsorb == "SELLERS ABSORBED" ? W_ABSORB : 0)
+            wLongScore := wLongScore + (stStackRows >= STACK_ROWS_MIN ? W_STACK : 0)
+            wLongScore := wLongScore + (stReclaim == "CONFIRMED" ? W_RECLAIM : 0)
+            wLongScore := wLongScore + (stFlow == "BULLISH_SHIFT" ? W_FLOW : 0)
             // 15M context is a score input, NOT a veto:
-            longScore := longScore + (not na(ema15) and close > ema15 ? W_CTX15 : 0)
+            wLongScore := wLongScore + (not na(ema15) and close > ema15 ? W_CTX15 : 0)
         else
-            shortScore := W_SWEEP
-            shortScore := shortScore + (stAbsorb == "BUYERS ABSORBED" ? W_ABSORB : 0)
-            shortScore := shortScore + (stStackRows >= STACK_ROWS_MIN ? W_STACK : 0)
-            shortScore := shortScore + (stReclaim == "CONFIRMED" ? W_RECLAIM : 0)
-            shortScore := shortScore + (stFlow == "BEARISH_SHIFT" ? W_FLOW : 0)
-            shortScore := shortScore + (not na(ema15) and close < ema15 ? W_CTX15 : 0)
-        gapV := longScore >= shortScore ? longScore - shortScore : shortScore - longScore
+            wShortScore := W_SWEEP
+            wShortScore := wShortScore + (stAbsorb == "BUYERS ABSORBED" ? W_ABSORB : 0)
+            wShortScore := wShortScore + (stStackRows >= STACK_ROWS_MIN ? W_STACK : 0)
+            wShortScore := wShortScore + (stReclaim == "CONFIRMED" ? W_RECLAIM : 0)
+            wShortScore := wShortScore + (stFlow == "BEARISH_SHIFT" ? W_FLOW : 0)
+            wShortScore := wShortScore + (not na(ema15) and close < ema15 ? W_CTX15 : 0)
+        wGap := wLongScore >= wShortScore ? wLongScore - wShortScore : wShortScore - wLongScore
 
         // 6. clean target + 1.8R room check (nearest opposing liquidity)
-        float entryP = close
-        float stopP  = na
-        float tgtP   = na
-        if isLong
-            stopP := stLevel - 0.25 * atrV
-            if not na(pdh) and pdh > entryP
-                tgtP   := pdh
-                tgtRef := "PDH"
-            if not na(sessHi) and sessHi > entryP and (na(tgtP) or sessHi < tgtP)
-                tgtP   := sessHi
-                tgtRef := "SESSION_HIGH"
+        float wEntryP = close
+        float wStopP  = na
+        float wTgtP   = na
+        if wIsLong
+            wStopP := stLevel - 0.25 * atrV
+            if not na(pdh) and pdh > wEntryP
+                wTgtP   := pdh
+                wTgtRef := "PDH"
+            if not na(sessHi) and sessHi > wEntryP and (na(wTgtP) or sessHi < wTgtP)
+                wTgtP   := sessHi
+                wTgtRef := "SESSION_HIGH"
         else
-            stopP := stLevel + 0.25 * atrV
-            if not na(pdl) and pdl < entryP
-                tgtP   := pdl
-                tgtRef := "PDL"
-            if not na(sessLo) and sessLo < entryP and (na(tgtP) or sessLo > tgtP)
-                tgtP   := sessLo
-                tgtRef := "SESSION_LOW"
-        float riskP = isLong ? entryP - stopP : stopP - entryP
-        roomV := not na(tgtP) and riskP > 0 ? (isLong ? tgtP - entryP : entryP - tgtP) / riskP : na
+            wStopP := stLevel + 0.25 * atrV
+            if not na(pdl) and pdl < wEntryP
+                wTgtP   := pdl
+                wTgtRef := "PDL"
+            if not na(sessLo) and sessLo < wEntryP and (na(wTgtP) or sessLo > wTgtP)
+                wTgtP   := sessLo
+                wTgtRef := "SESSION_LOW"
+        float wRiskP = wIsLong ? wEntryP - wStopP : wStopP - wEntryP
+        wRoom := not na(wTgtP) and wRiskP > 0 ? (wIsLong ? wTgtP - wEntryP : wEntryP - wTgtP) / wRiskP : na
 
         // ---- gates -> armed ----
-        int  scoreV      = isLong ? longScore : shortScore
-        bool gateScore   = scoreV >= scoreFloor
-        bool gateGap     = gapV >= gapFloor
-        bool gateRoom    = not na(roomV) and roomV >= roomFloor
-        bool gateFresh   = barsSince <= inFresh
-        bool gateRows    = stStackRows >= STACK_ROWS_MIN
-        bool gateAbsorb  = stAbsorb == (isLong ? "SELLERS ABSORBED" : "BUYERS ABSORBED")
-        bool gateReclaim = stReclaim == "CONFIRMED"
-        bool gateFlow    = stFlow == (isLong ? "BULLISH_SHIFT" : "BEARISH_SHIFT")
-        newlyArmed := fpOk and not stArmed and gateScore and gateGap and gateRoom and gateFresh and gateRows and gateAbsorb and gateReclaim and gateFlow
-        if newlyArmed
+        int  wScoreV     = wIsLong ? wLongScore : wShortScore
+        bool wGateScore  = wScoreV >= scoreFloor
+        bool wGateGap    = wGap >= gapFloor
+        bool wGateRoom   = not na(wRoom) and wRoom >= roomFloor
+        bool wGateFresh  = wBarsSince <= inFresh
+        bool wGateRows   = stStackRows >= STACK_ROWS_MIN
+        bool wGateAbsorb = stAbsorb == (wIsLong ? "SELLERS ABSORBED" : "BUYERS ABSORBED")
+        bool wGateReclaim = stReclaim == "CONFIRMED"
+        bool wGateFlow   = stFlow == (wIsLong ? "BULLISH_SHIFT" : "BEARISH_SHIFT")
+        wNewlyArmed := wFpOk and not stArmed and wGateScore and wGateGap and wGateRoom and wGateFresh and wGateRows and wGateAbsorb and wGateReclaim and wGateFlow
+        if wNewlyArmed
             stArmed    := true
             stArmedBar := bar_index
 
         // ---- release: first confirmed bar AFTER the armed bar ----
         // The armed decision is frozen at its bar close; later market behavior
         // never rewrites it (matches desk policy: judge the decision at the time).
-        doRelease := stArmed and not stReleased and bar_index > stArmedBar
-        if doRelease
+        wDoRelease := stArmed and not stReleased and bar_index > stArmedBar
+        if wDoRelease
             stReleased     := true
             stReleaseState := "RELEASED"
 
         // ---- transitions (for event priority) ----
-        newAbsorb  := stAbsorb != "NONE" and prevAbsorb == "NONE"
-        newReclaim := stReclaim == "CONFIRMED" and prevReclaim != "CONFIRMED"
-        newFlow    := (stFlow == "BULLISH_SHIFT" or stFlow == "BEARISH_SHIFT") and prevFlow == "NEUTRAL"
+        wNewAbsorb  := stAbsorb != "NONE" and wPrevAbsorb == "NONE"
+        wNewReclaim := stReclaim == "CONFIRMED" and wPrevReclaim != "CONFIRMED"
+        wNewFlow    := (stFlow == "BULLISH_SHIFT" or stFlow == "BEARISH_SHIFT") and wPrevFlow == "NEUTRAL"
 
         // ---- terminal: expired or failed -> silent reset (no resurrection) ----
-        terminal := stReclaim == "FAILED" or (barsSince > inFresh and not stArmed)
+        wTerminal := stReclaim == "FAILED" or (wBarsSince > inFresh and not stArmed)
 
     // ---- event selection: one alert per bar close, highest priority wins ----
     // TEST_PING works even with no active setup.
     if inTestPing and not pingDone
-        evType := "TEST_PING"
-    else if not fpOk and (newSweepL or newSweepS)
-        evType := "DATA_UNAVAILABLE"
-    else if doRelease
-        evType := "RELEASE"
-    else if newlyArmed
-        evType := "ARMED"
-    else if newFlow
-        evType := "FLOW_SHIFT"
-    else if newReclaim
-        evType := "RECLAIM_CONFIRMED"
-    else if newAbsorb
-        evType := "ABSORPTION_CONFIRMED"
-    else if newSweepL or newSweepS
-        evType := "SWEEP_DETECTED"
+        wEvType := "TEST_PING"
+    else if not wFpOk and (wNewSweepL or wNewSweepS)
+        wEvType := "DATA_UNAVAILABLE"
+    else if wDoRelease
+        wEvType := "RELEASE"
+    else if wNewlyArmed
+        wEvType := "ARMED"
+    else if wNewFlow
+        wEvType := "FLOW_SHIFT"
+    else if wNewReclaim
+        wEvType := "RECLAIM_CONFIRMED"
+    else if wNewAbsorb
+        wEvType := "ABSORPTION_CONFIRMED"
+    else if wNewSweepL or wNewSweepS
+        wEvType := "SWEEP_DETECTED"
 
     // ---- populate the astra-edge-event-v1.1 contract ----
-    if evType != ""
-        bool isDU   = evType == "DATA_UNAVAILABLE"
-        bool isPing = evType == "TEST_PING"
-        int  freshV = stDir == "NONE" ? 0 : bar_index - stBar
-        g_event_type    = evType
-        g_event_id      = syminfo.ticker + "_" + str.tostring(int(time)) + "_" + evType
+    if wEvType != ""
+        bool wIsDU   = wEvType == "DATA_UNAVAILABLE"
+        bool wIsPing = wEvType == "TEST_PING"
+        int  wFreshV = stDir == "NONE" ? 0 : bar_index - stBar
+        g_event_type    = wEvType
+        g_event_id      = syminfo.ticker + "_" + str.tostring(int(time)) + "_" + wEvType
         g_symbol        = syminfo.ticker
         g_contract      = inContract == "" ? syminfo.ticker : inContract
-        g_direction     = (isDU or isPing) ? "NONE" : stDir
+        g_direction     = (wIsDU or wIsPing) ? "NONE" : stDir
         g_market_ts     = int(time)
         g_observed      = int(timenow)
-        g_setup_id      = isPing ? "TEST-PING" : stSetupId
-        g_liq_type      = isPing ? "NONE" : stLiqType
-        g_liq_price     = isPing ? na : stLevel
-        g_sweep_conf    = not isPing and stDir != "NONE"
-        g_absorption    = isDU ? "DATA_UNAVAILABLE" : isPing ? "NONE" : stAbsorb
-        g_flow          = isDU ? "DATA_UNAVAILABLE" : isPing ? "NEUTRAL" : stFlow
-        g_long          = (isDU or isPing) ? 0 : longScore
-        g_short         = (isDU or isPing) ? 0 : shortScore
-        g_gap           = (isDU or isPing) ? 0 : gapV
-        g_reclaim       = isDU ? "DATA_UNAVAILABLE" : isPing ? "NONE" : stReclaim
-        g_room_r        = (isDU or isPing) ? na : roomV
-        g_target_ref    = tgtRef
+        g_setup_id      = wIsPing ? "TEST-PING" : stSetupId
+        g_liq_type      = wIsPing ? "NONE" : stLiqType
+        g_liq_price     = wIsPing ? na : stLevel
+        g_sweep_conf    = not wIsPing and stDir != "NONE"
+        g_absorption    = wIsDU ? "DATA_UNAVAILABLE" : wIsPing ? "NONE" : stAbsorb
+        g_flow          = wIsDU ? "DATA_UNAVAILABLE" : wIsPing ? "NEUTRAL" : stFlow
+        g_long          = (wIsDU or wIsPing) ? 0 : wLongScore
+        g_short         = (wIsDU or wIsPing) ? 0 : wShortScore
+        g_gap           = (wIsDU or wIsPing) ? 0 : wGap
+        g_reclaim       = wIsDU ? "DATA_UNAVAILABLE" : wIsPing ? "NONE" : stReclaim
+        g_room_r        = (wIsDU or wIsPing) ? na : wRoom
+        g_target_ref    = wTgtRef
         // armed=true is emitted ONLY with ARMED/RELEASE (relay coherence rule).
-        g_armed         = evType == "ARMED" or evType == "RELEASE"
+        g_armed         = wEvType == "ARMED" or wEvType == "RELEASE"
         g_release_state = stReleaseState
-        g_fp_ok         = fpOk
-        g_fresh_bars    = freshV
+        g_fp_ok         = wFpOk
+        g_fresh_bars    = wFreshV
         g_stack_rows    = stStackRows
         f_emit_event()
-        if isPing
+        if wIsPing
             pingDone := true
-        if doRelease
-            relDir := stDir     // capture before reset clears it
-            f_reset_setup()     // one-shot: a released setup never re-fires
+        if wDoRelease
+            wRelDir := stDir     // capture before reset clears it
+            // ---- inline reset (global scope only; see note above) ----
+            stDir          := "NONE"
+            stLevel        := na
+            stLiqType      := "NONE"
+            stBar          := na
+            stTime         := na
+            stAbsorb       := "NONE"
+            stReclaim      := "NONE"
+            stFlow         := "NEUTRAL"
+            stArmed        := false
+            stArmedBar     := na
+            stReleased     := false
+            stReleaseState := "PENDING"
+            stSetupId      := ""
+            cumDelta       := 0.0
+            stStackRows    := 0
+            // one-shot: a released setup never re-fires
 
-    if terminal and not doRelease
-        f_reset_setup()
+    if wTerminal and not wDoRelease
+        // ---- inline reset (global scope only; see note above) ----
+        stDir          := "NONE"
+        stLevel        := na
+        stLiqType      := "NONE"
+        stBar          := na
+        stTime         := na
+        stAbsorb       := "NONE"
+        stReclaim      := "NONE"
+        stFlow         := "NEUTRAL"
+        stArmed        := false
+        stArmedBar     := na
+        stReleased     := false
+        stReleaseState := "PENDING"
+        stSetupId      := ""
+        cumDelta       := 0.0
+        stStackRows    := 0
 
     // ---- plot signal flags (global scope copies) ----
-    sigSweepL  := newSweepL
-    sigSweepS  := newSweepS
-    sigReclaim := newReclaim
-    sigArmedB  := newlyArmed
-    sigRelL    := doRelease and relDir == "LONG"
-    sigRelS    := doRelease and relDir == "SHORT"
+    sigSweepL  := wNewSweepL
+    sigSweepS  := wNewSweepS
+    sigReclaim := wNewReclaim
+    sigArmedB  := wNewlyArmed
+    sigRelL    := wDoRelease and wRelDir == "LONG"
+    sigRelS    := wDoRelease and wRelDir == "SHORT"
 
 // ════════════════════════════ PLOTS ══════════════════════════════════════════
 // Confirmed markers fire only on confirmed bars. Intrabar "PROV" markers are
