@@ -1,0 +1,476 @@
+//@version=6
+// =============================================================================
+//  R&A ASTRA Edge v1.1 — TradingView dynamic alert() emitter (Pine Script v6)
+// =============================================================================
+//  Contract : astra-edge-event-v1.1 (30 canonical keys, ASCII-sorted)
+//  Strategy : STRATEGY2_ASTRA_EDGE_V1 · version 1.0.2
+//  Mode     : SHADOW ONLY · order_permission = false
+//
+//  WHAT THIS DOES
+//  Emits ONE dynamic alert() JSON per confirmed signal bar, carrying the actual
+//  footprint/delta/CVD readings from request.footprint(). The receiving edge
+//  validates, canonicalizes, and HMAC-signs off-chart — Pine never sees a
+//  secret, never sends payload_hash, and never assigns strategy_run_id.
+//
+//  WHAT THIS DOES NOT DO
+//  No orders. No brokerage. No secrets in the script. No invented evidence:
+//  missing footprint takes the DATA_UNAVAILABLE path (scores stay 0,
+//  absorption reports DATA_UNAVAILABLE) — delta is never assumed 0.
+//
+//  NO-REPAINT CONTRACT
+//  Every state transition is evaluated ONLY on confirmed bars
+//  (barstate.isconfirmed). Multi-timeframe reads use lookahead_off.
+//  Intrabar values may plot as PROV and can never trigger an alert.
+//
+//  FROZEN GATES (inputs can raise, never lower)
+//  score >= 72 · directional gap >= 15 · room >= 1.8R · freshness <= 8 bars ·
+//  2-row stacked imbalance. 15M context is a score input, NEVER a veto.
+//
+//  SETUP (Ric's steps, in TradingView)
+//  1. Paste this script into the Pine Editor on the NQ1! 1-minute chart and
+//     "Add to chart".
+//  2. Create an alert: Condition = this indicator, "alert() function calls
+//     only", Webhook URL = the relay /ingest/tv URL, Message = {{strategy.order.alert_message}}
+//     (leave the message box as the placeholder — the script supplies the JSON).
+//  3. Fire the built-in TEST_PING first (input D), then watch the relay log.
+//
+//  Connectivity test vs profitability proof: this emitter proves ONE genuine
+//  alert traverses footprint -> delta -> JSON -> webhook -> lifecycle -> audit.
+//  It says nothing about strategy profitability — that is the counted shadow
+//  sample (separate, later, sample_count starts at 0).
+// =============================================================================
+
+indicator("R&A ASTRA Edge v1.1 emitter", overlay=true)
+
+// ════════════════════════════ INPUTS ════════════════════════════════════════
+// No secret input. No run-id input. Both are assigned off-chart.
+
+inScoreMin = input.int(72, "Score threshold (B+)",
+     minval=72, group="Gates",
+     tooltip="Locked floor 72. Can be raised, never lowered.")
+inGapMin   = input.int(15, "Directional gap",
+     minval=15, group="Gates",
+     tooltip="Locked floor 15. Can be raised, never lowered.")
+inRoomMin  = input.float(1.8, "Min room to target (R)",
+     minval=1.8, step=0.1, group="Gates",
+     tooltip="Locked floor 1.8R. Can be raised, never lowered.")
+inFresh    = input.int(8, "Freshness window (bars)",
+     minval=1, maxval=8, group="Gates",
+     tooltip="Sweep evidence expires after this many 1M bars. Contract max 8.")
+inContract = input.string("", "Contract override (blank = chart symbol)",
+     group="Symbol")
+inTestPing = input.bool(false, "Send TEST_PING on next bar close (one-shot)",
+     group="Diagnostics",
+     tooltip="Fires one TEST_PING event to verify the webhook path, then latches off.")
+
+scoreFloor = math.max(inScoreMin, 72)
+gapFloor   = math.max(inGapMin, 15)
+roomFloor  = math.max(inRoomMin, 1.8)
+
+// Frozen (non-input) constants.
+STACK_ROWS_MIN = 2        // 2-row stacked imbalance (frozen)
+W_SWEEP  = 25             // evidence weights, long/short symmetric, sum = 100
+W_ABSORB = 15
+W_STACK  = 10
+W_RECLAIM = 15
+W_FLOW   = 20
+W_CTX15  = 15             // 15M context: score input only, NOT a veto
+
+STRAT_ID  = "STRATEGY2_ASTRA_EDGE_V1"
+STRAT_VER = "1.0.2"
+SCHEMA_V  = "astra-edge-event-v1.1"
+
+// ═══════════════════ CONTRACT FIELD GLOBALS (per emitted event) ════════════
+
+string g_event_type = ""
+string g_event_id   = ""
+string g_symbol     = ""
+string g_contract   = ""
+string g_direction  = "NONE"
+int    g_market_ts  = 0
+int    g_observed   = 0
+string g_setup_id   = ""
+string g_liq_type   = "NONE"
+float  g_liq_price  = na
+bool   g_sweep_conf = false
+string g_absorption = "NONE"
+string g_flow       = "NEUTRAL"
+int    g_long       = 0
+int    g_short      = 0
+int    g_gap        = 0
+string g_reclaim    = "NONE"
+float  g_room_r     = na
+string g_target_ref = "NONE"
+bool   g_armed      = false
+string g_release_state = "PENDING"
+bool   g_fp_ok      = false
+int    g_fresh_bars = 0
+int    g_stack_rows = 0
+
+// ════════════════════════ CANONICAL JSON BUILDER ═══════════════════════════
+// ASCII-sorted keys, compact separators. payload_hash is NEVER emitted by
+// Pine — the edge computes it after validation. strategy_run_id is null on
+// the wire (ruling 5: locally assigned; null or omitted only).
+
+f_jstr(s)  => "\"" + s + "\""
+f_jbool(b) => b ? "true" : "false"
+f_jint(x)  => str.tostring(int(x))
+
+// Number with exactly 2 decimals, or null for na. Matches the receiver's
+// canonicalizer bit-for-bit (abs*100, round half away from zero).
+f_jnum2(x) =>
+    string out = "null"
+    if not na(x)
+        float ax = math.abs(x)
+        int r = int(math.round(ax * 100))
+        int cents = r % 100
+        out := (x < 0 ? "-" : "") + str.tostring(int(r / 100)) + "." + (cents < 10 ? "0" + str.tostring(cents) : str.tostring(cents))
+    out
+
+f_canon_json() =>
+    "{\"absorption_state\":"     + f_jstr(g_absorption)   + "," +
+     "\"armed\":"                + f_jbool(g_armed)       + "," +
+     "\"chart_timeframe\":"      + f_jstr(timeframe.period) + "," +
+     "\"contract\":"             + f_jstr(g_contract)     + "," +
+     "\"direction\":"            + f_jstr(g_direction)    + "," +
+     "\"directional_gap\":"      + f_jint(g_gap)          + "," +
+     "\"event_id\":"             + f_jstr(g_event_id)     + "," +
+     "\"event_type\":"           + f_jstr(g_event_type)   + "," +
+     "\"flow_state\":"           + f_jstr(g_flow)         + "," +
+     "\"footprint_available\":"  + f_jbool(g_fp_ok)       + "," +
+     "\"freshness_bars\":"       + f_jint(g_fresh_bars)   + "," +
+     "\"liquidity_price\":"      + f_jnum2(g_liq_price)   + "," +
+     "\"liquidity_type\":"       + f_jstr(g_liq_type)     + "," +
+     "\"long_score\":"           + f_jint(g_long)         + "," +
+     "\"market_ts\":"            + f_jint(g_market_ts)    + "," +
+     "\"observed_at\":"          + f_jint(g_observed)     + "," +
+     "\"reclaim_state\":"        + f_jstr(g_reclaim)      + "," +
+     "\"release_state\":"        + f_jstr(g_release_state)+ "," +
+     "\"room_r\":"               + f_jnum2(g_room_r)      + "," +
+     "\"schema_version\":"       + f_jstr(SCHEMA_V)       + "," +
+     "\"setup_id\":"             + f_jstr(g_setup_id)     + "," +
+     "\"short_score\":"          + f_jint(g_short)        + "," +
+     "\"source_bar_close\":1," +
+     "\"stacked_imbalance_rows\":" + f_jint(g_stack_rows) + "," +
+     "\"strategy_id\":"          + f_jstr(STRAT_ID)       + "," +
+     "\"strategy_run_id\":null," +
+     "\"strategy_version\":"     + f_jstr(STRAT_VER)      + "," +
+     "\"sweep_confirmed\":"      + f_jbool(g_sweep_conf)  + "," +
+     "\"symbol\":"               + f_jstr(g_symbol)       + "," +
+     "\"target_reference\":"     + f_jstr(g_target_ref)   + "}"
+
+// One alert per bar close, highest-priority signal wins.
+f_emit_event() =>
+    alert(f_canon_json(), alert.freq_once_per_bar_close)
+
+// ════════════════════ MULTI-TIMEFRAME CONTEXT (15M / 2M) ════════════════════
+// lookahead_off everywhere: no future leak, no repaint.
+
+pdh    = request.security(syminfo.tickerid, "D",  high[1], lookahead=barmerge.lookahead_off)
+pdl    = request.security(syminfo.tickerid, "D",  low[1],  lookahead=barmerge.lookahead_off)
+sessHi = request.security(syminfo.tickerid, "15", ta.highest(high, 26), lookahead=barmerge.lookahead_off)
+sessLo = request.security(syminfo.tickerid, "15", ta.lowest(low, 26),  lookahead=barmerge.lookahead_off)
+ema15  = request.security(syminfo.tickerid, "15", ta.ema(close, 21),   lookahead=barmerge.lookahead_off)
+
+// ════════════════════════ FOOTPRINT ADAPTER ═════════════════════════════════
+// request.footprint(ticker, timeframe) -> [buyVol, sellVol, delta,
+// bullStackRows, bearStackRows]. Requires a TradingView build/plan exposing
+// footprint data; otherwise every output is na and the DATA_UNAVAILABLE path
+// engages. Delta is NEVER synthesized from OHLC — missing footprint is
+// reported, never faked.
+[fpBuy, fpSell, fpDelta, fpBullRows, fpBearRows] = request.footprint(syminfo.tickerid, "1")
+fpOk = not na(fpDelta)
+
+// ════════════════════ SIGNAL STATE (confirmed bars only) ═══════════════════
+
+var string stDir          = "NONE"    // "LONG" | "SHORT" | "NONE"
+var float  stLevel        = na        // swept liquidity level
+var string stLiqType      = "NONE"    // "PDL" | "PDH"
+var int    stBar          = na
+var int    stTime         = na
+var string stAbsorb       = "NONE"    // "SELLERS ABSORBED" | "BUYERS ABSORBED" | "NONE"
+var string stReclaim      = "NONE"    // "NONE" | "PENDING" | "CONFIRMED" | "FAILED"
+var string stFlow         = "NEUTRAL" // "BULLISH_SHIFT" | "BEARISH_SHIFT" | "NEUTRAL"
+var bool   stArmed        = false
+var int    stArmedBar     = na
+var bool   stReleased     = false
+var string stReleaseState = "PENDING" // "PENDING" | "RELEASED"
+var string stSetupId      = ""
+var float  cumDelta       = 0.0       // footprint delta accumulated since sweep
+var int    stStackRows    = 0         // max stacked imbalance rows seen (wire field)
+var bool   pingDone       = false     // TEST_PING one-shot latch
+
+// Global signal flags for plots (block-scoped vars can't be plotted).
+sigSweepL  = false
+sigSweepS  = false
+sigReclaim = false
+sigArmedB  = false
+sigRelL    = false
+sigRelS    = false
+
+f_reset_setup() =>
+    stDir          := "NONE"
+    stLevel        := na
+    stLiqType      := "NONE"
+    stBar          := na
+    stTime         := na
+    stAbsorb       := "NONE"
+    stReclaim      := "NONE"
+    stFlow         := "NEUTRAL"
+    stArmed        := false
+    stArmedBar     := na
+    stReleased     := false
+    stReleaseState := "PENDING"
+    stSetupId      := ""
+    cumDelta       := 0.0
+    stStackRows    := 0
+
+// ═══════════════════════ MAIN: CONFIRMED BARS ONLY ══════════════════════════
+
+if barstate.isconfirmed
+    atrV = ta.atr(14)
+
+    // ---- per-bar working vars ----
+    bool newSweepL  = false
+    bool newSweepS  = false
+    bool newAbsorb  = false
+    bool newReclaim = false
+    bool newFlow    = false
+    bool newlyArmed = false
+    bool doRelease  = false
+    bool terminal   = false
+    int  longScore  = 0
+    int  shortScore = 0
+    int  gapV       = 0
+    float roomV     = na
+    string tgtRef   = "NONE"
+    string evType   = ""
+    string relDir   = "NONE"      // release direction, captured before reset
+
+    string prevAbsorb  = stAbsorb
+    string prevReclaim = stReclaim
+    string prevFlow    = stFlow
+
+    // ---- 1. liquidity sweep detection (wick through PDH/PDL) ----
+    newSweepL := stDir == "NONE" and not na(pdl) and low < pdl
+    newSweepS := stDir == "NONE" and not na(pdh) and high > pdh
+    if newSweepL or newSweepS
+        stDir          := newSweepL ? "LONG" : "SHORT"
+        stLevel        := newSweepL ? pdl : pdh
+        stLiqType      := newSweepL ? "PDL" : "PDH"
+        stBar          := bar_index
+        stTime         := int(time)
+        stAbsorb       := "NONE"
+        stReclaim      := "PENDING"
+        stFlow         := "NEUTRAL"
+        stArmed        := false
+        stArmedBar     := na
+        stReleased     := false
+        stReleaseState := "PENDING"
+        stSetupId      := "ASTRA-" + syminfo.ticker + "-" + stDir + "-" + str.tostring(stTime)
+        cumDelta       := 0.0
+        stStackRows    := 0
+
+    // ---- 2..6 active setup pipeline ----
+    if stDir != "NONE"
+        bool isLong = stDir == "LONG"
+        int barsSince = bar_index - stBar
+
+        // footprint delta accumulation (confirmed bars only)
+        if fpOk
+            cumDelta := cumDelta + fpDelta
+            int rowsNow = isLong ? int(fpBullRows) : int(fpBearRows)
+            if rowsNow > stStackRows
+                stStackRows := rowsNow
+
+        // 2. absorption: delta leans with the setup while the level holds
+        if fpOk and stAbsorb == "NONE"
+            bool heldL = isLong  and low  >= stLevel - 0.10 * atrV
+            bool heldS = not isLong and high <= stLevel + 0.10 * atrV
+            if isLong and cumDelta > 0 and heldL
+                stAbsorb := "SELLERS ABSORBED"
+            if not isLong and cumDelta < 0 and heldS
+                stAbsorb := "BUYERS ABSORBED"
+
+        // 3. reclaim: close back through the swept level (close-confirmed)
+        if isLong and close > stLevel
+            stReclaim := "CONFIRMED"
+        if not isLong and close < stLevel
+            stReclaim := "CONFIRMED"
+        // invalidation: level lost badly -> FAILED (terminal, silent reset)
+        if (isLong and close < stLevel - 0.5 * atrV) or (not isLong and close > stLevel + 0.5 * atrV)
+            stReclaim := "FAILED"
+
+        // 4. flow shift: displacement = range expansion + strong directional close
+        float rng = high - low
+        if isLong and rng > 1.5 * atrV and close > open and close >= high - 0.25 * rng
+            stFlow := "BULLISH_SHIFT"
+        if not isLong and rng > 1.5 * atrV and close < open and close <= low + 0.25 * rng
+            stFlow := "BEARISH_SHIFT"
+
+        // 5. evidence scores 0-100 (symmetric, sum of weights = 100)
+        if isLong
+            longScore := W_SWEEP
+            longScore := longScore + (stAbsorb == "SELLERS ABSORBED" ? W_ABSORB : 0)
+            longScore := longScore + (stStackRows >= STACK_ROWS_MIN ? W_STACK : 0)
+            longScore := longScore + (stReclaim == "CONFIRMED" ? W_RECLAIM : 0)
+            longScore := longScore + (stFlow == "BULLISH_SHIFT" ? W_FLOW : 0)
+            // 15M context is a score input, NOT a veto:
+            longScore := longScore + (not na(ema15) and close > ema15 ? W_CTX15 : 0)
+        else
+            shortScore := W_SWEEP
+            shortScore := shortScore + (stAbsorb == "BUYERS ABSORBED" ? W_ABSORB : 0)
+            shortScore := shortScore + (stStackRows >= STACK_ROWS_MIN ? W_STACK : 0)
+            shortScore := shortScore + (stReclaim == "CONFIRMED" ? W_RECLAIM : 0)
+            shortScore := shortScore + (stFlow == "BEARISH_SHIFT" ? W_FLOW : 0)
+            shortScore := shortScore + (not na(ema15) and close < ema15 ? W_CTX15 : 0)
+        gapV := longScore >= shortScore ? longScore - shortScore : shortScore - longScore
+
+        // 6. clean target + 1.8R room check (nearest opposing liquidity)
+        float entryP = close
+        float stopP  = na
+        float tgtP   = na
+        if isLong
+            stopP := stLevel - 0.25 * atrV
+            if not na(pdh) and pdh > entryP
+                tgtP   := pdh
+                tgtRef := "PDH"
+            if not na(sessHi) and sessHi > entryP and (na(tgtP) or sessHi < tgtP)
+                tgtP   := sessHi
+                tgtRef := "SESSION_HIGH"
+        else
+            stopP := stLevel + 0.25 * atrV
+            if not na(pdl) and pdl < entryP
+                tgtP   := pdl
+                tgtRef := "PDL"
+            if not na(sessLo) and sessLo < entryP and (na(tgtP) or sessLo > tgtP)
+                tgtP   := sessLo
+                tgtRef := "SESSION_LOW"
+        float riskP = isLong ? entryP - stopP : stopP - entryP
+        roomV := not na(tgtP) and riskP > 0 ? (isLong ? tgtP - entryP : entryP - tgtP) / riskP : na
+
+        // ---- gates -> armed ----
+        int  scoreV      = isLong ? longScore : shortScore
+        bool gateScore   = scoreV >= scoreFloor
+        bool gateGap     = gapV >= gapFloor
+        bool gateRoom    = not na(roomV) and roomV >= roomFloor
+        bool gateFresh   = barsSince <= inFresh
+        bool gateRows    = stStackRows >= STACK_ROWS_MIN
+        bool gateAbsorb  = stAbsorb == (isLong ? "SELLERS ABSORBED" : "BUYERS ABSORBED")
+        bool gateReclaim = stReclaim == "CONFIRMED"
+        bool gateFlow    = stFlow == (isLong ? "BULLISH_SHIFT" : "BEARISH_SHIFT")
+        newlyArmed := fpOk and not stArmed and gateScore and gateGap and gateRoom and gateFresh and gateRows and gateAbsorb and gateReclaim and gateFlow
+        if newlyArmed
+            stArmed    := true
+            stArmedBar := bar_index
+
+        // ---- release: first confirmed bar AFTER the armed bar ----
+        // The armed decision is frozen at its bar close; later market behavior
+        // never rewrites it (matches desk policy: judge the decision at the time).
+        doRelease := stArmed and not stReleased and bar_index > stArmedBar
+        if doRelease
+            stReleased     := true
+            stReleaseState := "RELEASED"
+
+        // ---- transitions (for event priority) ----
+        newAbsorb  := stAbsorb != "NONE" and prevAbsorb == "NONE"
+        newReclaim := stReclaim == "CONFIRMED" and prevReclaim != "CONFIRMED"
+        newFlow    := (stFlow == "BULLISH_SHIFT" or stFlow == "BEARISH_SHIFT") and prevFlow == "NEUTRAL"
+
+        // ---- terminal: expired or failed -> silent reset (no resurrection) ----
+        terminal := stReclaim == "FAILED" or (barsSince > inFresh and not stArmed)
+
+    // ---- event selection: one alert per bar close, highest priority wins ----
+    // TEST_PING works even with no active setup.
+    if inTestPing and not pingDone
+        evType := "TEST_PING"
+    else if not fpOk and (newSweepL or newSweepS)
+        evType := "DATA_UNAVAILABLE"
+    else if doRelease
+        evType := "RELEASE"
+    else if newlyArmed
+        evType := "ARMED"
+    else if newFlow
+        evType := "FLOW_SHIFT"
+    else if newReclaim
+        evType := "RECLAIM_CONFIRMED"
+    else if newAbsorb
+        evType := "ABSORPTION_CONFIRMED"
+    else if newSweepL or newSweepS
+        evType := "SWEEP_DETECTED"
+
+    // ---- populate the astra-edge-event-v1.1 contract ----
+    if evType != ""
+        bool isDU   = evType == "DATA_UNAVAILABLE"
+        bool isPing = evType == "TEST_PING"
+        int  freshV = stDir == "NONE" ? 0 : bar_index - stBar
+        g_event_type    = evType
+        g_event_id      = syminfo.ticker + "_" + str.tostring(int(time)) + "_" + evType
+        g_symbol        = syminfo.ticker
+        g_contract      = inContract == "" ? syminfo.ticker : inContract
+        g_direction     = (isDU or isPing) ? "NONE" : stDir
+        g_market_ts     = int(time)
+        g_observed      = int(timenow)
+        g_setup_id      = isPing ? "TEST-PING" : stSetupId
+        g_liq_type      = isPing ? "NONE" : stLiqType
+        g_liq_price     = isPing ? na : stLevel
+        g_sweep_conf    = not isPing and stDir != "NONE"
+        g_absorption    = isDU ? "DATA_UNAVAILABLE" : isPing ? "NONE" : stAbsorb
+        g_flow          = isDU ? "DATA_UNAVAILABLE" : isPing ? "NEUTRAL" : stFlow
+        g_long          = (isDU or isPing) ? 0 : longScore
+        g_short         = (isDU or isPing) ? 0 : shortScore
+        g_gap           = (isDU or isPing) ? 0 : gapV
+        g_reclaim       = isDU ? "DATA_UNAVAILABLE" : isPing ? "NONE" : stReclaim
+        g_room_r        = (isDU or isPing) ? na : roomV
+        g_target_ref    = tgtRef
+        // armed=true is emitted ONLY with ARMED/RELEASE (relay coherence rule).
+        g_armed         = evType == "ARMED" or evType == "RELEASE"
+        g_release_state = stReleaseState
+        g_fp_ok         = fpOk
+        g_fresh_bars    = freshV
+        g_stack_rows    = stStackRows
+        f_emit_event()
+        if isPing
+            pingDone := true
+        if doRelease
+            relDir := stDir     // capture before reset clears it
+            f_reset_setup()     // one-shot: a released setup never re-fires
+
+    if terminal and not doRelease
+        f_reset_setup()
+
+    // ---- plot signal flags (global scope copies) ----
+    sigSweepL  := newSweepL
+    sigSweepS  := newSweepS
+    sigReclaim := newReclaim
+    sigArmedB  := newlyArmed
+    sigRelL    := doRelease and relDir == "LONG"
+    sigRelS    := doRelease and relDir == "SHORT"
+
+// ════════════════════════════ PLOTS ══════════════════════════════════════════
+// Confirmed markers fire only on confirmed bars. Intrabar "PROV" markers are
+// explicitly provisional and never trigger alerts.
+
+plot(pdh, "PDH", color=color.new(color.red, 40), style=plot.style_linebr)
+plot(pdl, "PDL", color=color.new(color.green, 40), style=plot.style_linebr)
+
+plotshape(sigSweepL, title="Sweep low (confirmed)", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.orange, 0), size=size.small, text="SWEEP")
+plotshape(sigSweepS, title="Sweep high (confirmed)", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.orange, 0), size=size.small, text="SWEEP")
+plotshape(sigReclaim, title="Reclaim confirmed", style=shape.diamond,
+     location=location.belowbar, color=color.new(color.blue, 0), size=size.tiny, text="RECLAIM")
+plotshape(sigArmedB, title="Armed", style=shape.labelup,
+     location=location.belowbar, color=color.new(color.purple, 0), size=size.small, text="ARMED")
+plotshape(sigRelL, title="Release LONG", style=shape.labelup,
+     location=location.belowbar, color=color.new(color.green, 0), size=size.small, text="REL L")
+plotshape(sigRelS, title="Release SHORT", style=shape.labeldown,
+     location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="REL S")
+
+// Provisional intrabar sweep hints — labeled PROV, never alert.
+bool provL = not barstate.isconfirmed and stDir == "NONE" and not na(pdl) and low < pdl
+bool provS = not barstate.isconfirmed and stDir == "NONE" and not na(pdh) and high > pdh
+plotshape(provL, title="PROVISIONAL sweep low (intrabar, unconfirmed)", style=shape.circle,
+     location=location.belowbar, color=color.new(color.gray, 0), size=size.tiny, text="PROV")
+plotshape(provS, title="PROVISIONAL sweep high (intrabar, unconfirmed)", style=shape.circle,
+     location=location.abovebar, color=color.new(color.gray, 0), size=size.tiny, text="PROV")
